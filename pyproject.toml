@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pylme4"
+version = "0.1.0a1"
+description = "Linear mixed-effects models in Python — port of R lme4 (Bates et al.)"
+requires-python = ">=3.10"
+authors = [{name = "Ginger Analytics"}]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.10",
+    "pandas>=1.5",
+    "patsy>=0.5",
+    "scikit-sparse>=0.4.12",
+    "nlopt>=2.7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "rpy2>=3.5", "pytest-html"]
+
+[tool.setuptools.packages.find]
+include = ["pylme4*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["golden: tests requiring R+lme4 goldens"]
