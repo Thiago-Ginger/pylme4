@@ -45,6 +45,12 @@ tests/benchmark/data/
 tests/benchmark/results/
 tests/benchmark/report.html
 
+# Dados proprietarios e scripts ad-hoc de benchmark local (nunca versionar)
+*.parquet
+tests/test_base_salvador.py
+/bench_*.py
+/bench_*.json
+
 # -------- Editor / OS --------
 .vscode/
 .idea/

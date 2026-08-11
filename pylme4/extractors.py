@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 import scipy.linalg as la
 
+from .parallel import parallel_map, effective_n_jobs, resolve_parallel
+
 
 def fixef(m) -> pd.Series:
     """Fixed-effects coefficient vector (named)."""
@@ -392,8 +394,11 @@ def predict(m, newdata: pd.DataFrame | None = None, *,
                 [newdata[c].astype(str) for c in t.rhs_cols[1:]], sep=":")
         else:
             combined = newdata[t.rhs_cols[0]].astype(str)
-        level_to_idx = {lv: i for i, lv in enumerate(t.levels)}
-        codes = np.array([level_to_idx.get(v, -1) for v in combined], dtype=np.int64)
+        # pd.Categorical assigns each value its index in `categories` and -1
+        # to anything unseen — identical to the per-row dict lookup this
+        # replaces, but vectorized in C (2.8x at n=20k, 3.7x at n=200k).
+        codes = np.asarray(
+            pd.Categorical(combined, categories=t.levels).codes, dtype=np.int64)
         if (codes < 0).any() and not allow_new_levels:
             bad = set(combined[codes < 0])
             raise ValueError(
@@ -412,14 +417,22 @@ def predict(m, newdata: pd.DataFrame | None = None, *,
 
 
 def confint(m, level: float = 0.95, method: str = "Wald",
-            nsim: int = 500, seed: int | None = None) -> pd.DataFrame:
+            nsim: int = 500, seed: int | None = None,
+            n_jobs: int | None = None, parallel: bool = False) -> pd.DataFrame:
     """Confidence intervals on fixed effects.
 
     method='Wald'      : analytical Wald intervals (fast, asymptotic).
     method='boot'      : parametric bootstrap via :func:`bootMer` (percentile CI).
-    method='profile'   : not yet implemented.
+    method='profile'   : profile-likelihood intervals via :func:`confint_profile`.
+
+    ``parallel``/``n_jobs`` are forwarded to the parallel backend for the
+    'boot' and 'profile' methods (both are grids of independent refits);
+    they are ignored for 'Wald', which is a closed-form expression. See
+    :func:`bootMer` for what ``parallel``/``n_jobs`` mean -- in short,
+    ``parallel=False`` (the default) always runs serially.
     """
     method_l = method.lower()
+    jobs = resolve_parallel(parallel, n_jobs)
     if method_l == "wald":
         from scipy.stats import norm
         z = float(norm.ppf(0.5 + level / 2))
@@ -432,7 +445,7 @@ def confint(m, level: float = 0.95, method: str = "Wald",
             index=m.fe_names,
         )
     if method_l in ("boot", "parametric", "bootstrap"):
-        boot = bootMer(m, nsim=nsim, seed=seed)
+        boot = bootMer(m, nsim=nsim, seed=seed, parallel=True, n_jobs=jobs)
         betas = boot["beta"]
         alpha = 1.0 - level
         lo = np.quantile(betas, alpha / 2, axis=0)
@@ -445,7 +458,7 @@ def confint(m, level: float = 0.95, method: str = "Wald",
         )
     if method_l == "profile":
         from .profile import confint_profile
-        return confint_profile(m, level=level)
+        return confint_profile(m, level=level, parallel=True, n_jobs=jobs)
     raise NotImplementedError(
         f"method={method!r} not implemented (try 'Wald', 'boot' or 'profile')")
 
@@ -460,6 +473,15 @@ def simulate(m, nsim: int = 1, seed: int | None = None,
     For GLMM:   η_sim = Xβ + Z b_sim (+ offset)
                 y_sim = family.rvs(μ_sim = g^{-1}(η_sim), weights, σ)
     In both cases b_sim ~ N(0, σ² Σ(θ)) (with σ≡1 for fixed-dispersion families).
+
+    Notes
+    -----
+    This loop is deliberately **not** parallelized or vectorized over ``nsim``.
+    The draws are interleaved — ``b_sim`` for simulation *s*, then ``eta``,
+    then ``y_sim`` for the same *s* — so any regrouping would consume the
+    generator in a different order and return different numbers for the same
+    ``seed``. That is a changed result, not a floating-point difference.
+    Only order-preserving work (hoisting the ``Z`` view) is done here.
     """
     rng = np.random.default_rng(seed)
     st = m._pls_state
@@ -485,6 +507,9 @@ def simulate(m, nsim: int = 1, seed: int | None = None,
     Xbeta = st.X @ m.beta
     offset = getattr(st, "offset", None)
     weights = getattr(st, "weights", np.ones(n))
+    # Z is fixed across simulations; build the CSR view once. The RNG draw
+    # order is deliberately left untouched (see the note in the docstring).
+    Z = st.Zt.T if m.q > 0 else None
     for s in range(nsim):
         if re_form == "none" or m.q == 0:
             b_sim = np.zeros(m.q)
@@ -495,7 +520,7 @@ def simulate(m, nsim: int = 1, seed: int | None = None,
                 b_block = sigma * z @ T.T                    # shape (li, pi)
                 b_parts.append(b_block.ravel())
             b_sim = np.concatenate(b_parts) if b_parts else np.zeros(0)
-        eta = np.asarray(Xbeta + (st.Zt.T @ b_sim if m.q > 0 else 0.0)).ravel()
+        eta = np.asarray(Xbeta + (Z @ b_sim if m.q > 0 else 0.0)).ravel()
         if offset is not None:
             eta = eta + offset
         if is_glmm:
@@ -506,47 +531,123 @@ def simulate(m, nsim: int = 1, seed: int | None = None,
     return Y
 
 
+def _boot_init(ctx):
+    """Worker-side setup: runs once per process, not once per resample.
+
+    The fitting dataframe travels here (pickled once per worker) instead of
+    riding along with every task. Each worker copies it so the response column
+    can be overwritten in place without touching the caller's frame — the
+    serial path gets the same private copy, which is what the previous
+    ``df_work = df.copy()`` did.
+    """
+    global _BOOT_CTX
+    ctx = dict(ctx)
+    ctx["df"] = ctx["df"].copy()
+    _BOOT_CTX = ctx
+
+
+def _boot_refit(item):
+    """Refit the model on one simulated response. Pure function of ``item``."""
+    from .fit import lmer, glmer
+    idx, y_sim = item
+    ctx = _BOOT_CTX
+    df = ctx["df"]
+    df[ctx["response"]] = y_sim
+    if ctx["is_glmm"]:
+        m_s = glmer(ctx["formula"], df, family=ctx["family"],
+                    weights=ctx["weights"], offset=ctx["offset"])
+    else:
+        m_s = lmer(ctx["formula"], df, REML=ctx["reml"])
+    if ctx["verbose"] and (idx + 1) % ctx["report_every"] == 0:
+        print(f"  bootMer {idx+1}/{ctx['nsim']} done")
+    return m_s.beta, float(np.sqrt(m_s.sigma2)), m_s.theta, bool(m_s.converged)
+
+
+_BOOT_CTX = None
+
+
 def bootMer(m, nsim: int = 500, seed: int | None = None,
-            verbose: bool = False) -> dict:
+            verbose: bool = False, n_jobs: int | None = None,
+            backend: str | None = None, parallel: bool = False) -> dict:
     """Parametric bootstrap (like lme4::bootMer).
 
     Refits the model on `nsim` simulated responses and returns the sampling
     distribution of (beta, sigma, theta). Dispatches to :func:`lmer` or
     :func:`glmer` depending on ``m.is_glmm``; for GLMM the family, weights
     and offset are preserved across refits.
+
+    Parameters
+    ----------
+    parallel : bool
+        ``False`` (the default) always runs serially, no matter what
+        ``n_jobs`` is set to -- parallel execution is opt-in, since it is
+        frequently *slower* than serial for small-to-medium models
+        (process-pool startup cost, and the ``scipy L-BFGS-B`` fallback used
+        when ``nlopt`` is unavailable is sensitive to which process it runs
+        in). Benchmark on your own model before setting this to ``True``.
+    n_jobs : int or None
+        Worker count, only used when ``parallel=True``. ``None`` (default)
+        means every CPU; pass a specific count, or a negative value
+        following the joblib convention (``-1`` = all CPUs, ``-2`` = all
+        but one, ...). Ignored (with a warning if explicitly set) when
+        ``parallel=False``.
+    backend : {"process", "thread"} or None
+        Execution backend; ``None`` means processes, which is what these
+        refits need (they are GIL-bound, not BLAS-bound).
+
+    Notes
+    -----
+    The `nsim` refits are completely independent: each one builds its own
+    design matrices and its own PLS/PIRLS state from a private copy of the
+    dataframe, and the results are reassembled in input order. The parallel
+    and serial paths therefore produce the same arrays.
+
+    The simulated responses are drawn **before** the fan-out, by the same
+    serial :func:`simulate` call as before, so a given ``seed`` yields the
+    same ``Ysim`` regardless of ``parallel``/``n_jobs``.
+
+    ``verbose`` progress lines are only emitted when running serially; with
+    several workers the ordering would be meaningless.
     """
-    from .fit import lmer, glmer
+    n_jobs = resolve_parallel(parallel, n_jobs)
     rng = np.random.default_rng(seed)
     Ysim = simulate(m, nsim=nsim, seed=int(rng.integers(0, 2**31 - 1)))
     df = getattr(m, "_fit_df", None)
     if df is None:
         raise RuntimeError(
             "bootMer needs the original dataframe; set m._fit_df = df after fit")
-    response = m.trms.response
     is_glmm = getattr(m, "is_glmm", False)
+    st = m._pls_state
+    jobs = effective_n_jobs(n_jobs, nsim)
+    ctx = {
+        "df": df,
+        "formula": m.formula,
+        "response": m.trms.response,
+        "is_glmm": is_glmm,
+        "reml": m.reml,
+        "family": m.family if is_glmm else None,
+        "weights": getattr(st, "weights", None) if is_glmm else None,
+        "offset": getattr(st, "offset", None) if is_glmm else None,
+        "verbose": bool(verbose) and jobs == 1,
+        "nsim": nsim,
+        "report_every": max(1, nsim // 10),
+    }
+    results = parallel_map(
+        _boot_refit,
+        [(s, Ysim[:, s]) for s in range(nsim)],
+        n_jobs=n_jobs, backend=backend,
+        initializer=_boot_init, initargs=(ctx,),
+    )
+
     betas = np.zeros((nsim, m.p))
     sigmas = np.zeros(nsim)
     thetas = np.zeros((nsim, m.theta.size))
     converged = np.zeros(nsim, dtype=bool)
-    df_work = df.copy()
-    st = m._pls_state
-    glmm_weights = getattr(st, "weights", None) if is_glmm else None
-    glmm_offset = getattr(st, "offset", None) if is_glmm else None
-    for s in range(nsim):
-        df_work[response] = Ysim[:, s]
-        if is_glmm:
-            m_s = glmer(
-                m.formula, df_work, family=m.family,
-                weights=glmm_weights, offset=glmm_offset,
-            )
-        else:
-            m_s = lmer(m.formula, df_work, REML=m.reml)
-        betas[s] = m_s.beta
-        sigmas[s] = float(np.sqrt(m_s.sigma2))
-        thetas[s] = m_s.theta
-        converged[s] = m_s.converged
-        if verbose and (s + 1) % max(1, nsim // 10) == 0:
-            print(f"  bootMer {s+1}/{nsim} done")
+    for s, (beta_s, sigma_s, theta_s, ok_s) in enumerate(results):
+        betas[s] = beta_s
+        sigmas[s] = sigma_s
+        thetas[s] = theta_s
+        converged[s] = ok_s
     return {
         "beta": betas, "sigma": sigmas, "theta": thetas,
         "converged": converged, "nsim": nsim,

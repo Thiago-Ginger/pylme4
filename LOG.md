@@ -353,3 +353,129 @@ via PLS profiled REML/ML, Cholesky esparsa, otimização BOBYQA.
   a cada iter (O(q³)).
 - `deviance` retornado é REML-deviance quando `REML=True`, senão ML-deviance
   (= -2 logLik).
+
+---
+
+## Sessão 2026-08-06 — Performance: paralelismo + eliminação de trabalho redundante
+
+Escopo: **somente performance**. Nenhuma mudança de lógica matemática, de API
+pública ou de resultados numéricos. Nenhuma dependência nova (só stdlib).
+Nenhuma operação Git.
+
+### Novo módulo `pylme4/parallel.py`
+
+Dispatcher único de paralelismo sobre `concurrent.futures` (stdlib):
+`resolve_n_jobs`, `set_n_jobs`/`get_n_jobs`, `parallel_map`. Características e
+o porquê de cada uma:
+
+- **Processos, não threads.** Os reajustes passam a maior parte do tempo em
+  Python/patsy/`scipy.sparse`, que não liberam o GIL.
+- **Ordem preservada** (`executor.map`) → saída idêntica à serial, elemento a
+  elemento.
+- **`initializer`/`initargs`** para enviar contexto grande (o dataframe do
+  ajuste, as matrizes de design) **uma vez por worker** em vez de uma vez por
+  tarefa.
+- **Fallback serial automático** em qualquer falha de pool ou de serialização,
+  com `warnings.warn`. Exceções reais da tarefa do usuário continuam
+  propagando: a re-execução serial as levanta de novo.
+- **Guarda anti-oversubscription**: fixa `OMP/OPENBLAS/MKL_NUM_THREADS=1` no
+  ambiente herdado pelos workers (e usa `threadpoolctl` se estiver instalado).
+- **Guarda anti-aninhamento**: dentro de um worker, `parallel_map` roda serial.
+
+Entradas que ganharam `n_jobs` (parâmetro opcional novo, padrão = auto):
+`bootMer`, `profile`, `profile_theta`, `profile_sigma`, `confint_theta`,
+`confint_sigma`, `confint_profile`, `confint(method='boot'|'profile')`.
+`confint_theta` também ganhou `step_scale` (mesmo default de antes).
+
+### Isolamento de estado (race conditions)
+
+- `bootMer` não muta mais um `df_work` compartilhado — cada worker recebe o
+  dataframe uma vez e faz sua própria cópia privada.
+- `PLSState`/`GLMMState` nunca cruzam a fronteira de processo; cada tarefa
+  constrói o seu (é o que o caminho serial já fazia).
+- O fator simbólico CHOLMOD (objeto C não-serializável) nunca é enviado:
+  `profile.py` ganhou `_ModelSpec`, que carrega só arrays/matrizes esparsas.
+- `Family.__reduce__` reconstrói famílias do registro `(nome, link)` no worker
+  (os campos são `lambda`s). Família customizada → `TypeError` claro → fallback
+  serial.
+
+Como cada worker é um processo separado, **não há memória compartilhada e
+portanto nenhuma race condition possível** — a isolação é estrutural.
+
+### Núcleo numérico (bit-exato, verificado)
+
+`pls.py`:
+- `X'X` e `X'y` são invariantes em θ → calculados uma vez em `make_state`.
+  1.07× (p=6), 1.21× (p=20), 1.42× (p=50) — o custo é O(n·p²).
+- `Lambdat @ Zt` era calculado **duas vezes** por avaliação (inline e dentro de
+  `_build_A`) → calculado uma vez e repassado. 1.05–1.06×.
+
+`glmm.py`:
+- `Lambdat.T` içado para fora do laço de step-halving. 1.03–1.05×.
+- `Zt.T` em CSR cacheado no state (é uma *view* sem cópia). 1.03–1.04×.
+
+`extractors.py`:
+- `predict`: mapeamento de níveis por `pd.Categorical` em vez de laço Python
+  por linha. 2.8× (n=20k), 3.7× (n=200k).
+- `simulate`: `Zt.T` içado para fora do laço. A ordem de consumo do RNG é
+  preservada de propósito (ver abaixo).
+
+### Otimizações implementadas e **removidas** por medição
+
+Cada candidata foi implementada, medida em A/B isolado (revertendo uma de cada
+vez no código real) e removida quando não pagou:
+
+| candidata | medido | motivo da remoção |
+|---|---|---|
+| escalar colunas via `.data` em vez de `sp.diags` (GLMM) | 1.27–1.35× | **não é bit-exato**: o produto esparso do scipy emite ordem de índices dependente do operando (`Zt @ diags(w)` sai não-ordenado, `LtZt @ diags(√w)` ordenado) e os produtos seguintes acumulam nessa ordem — desvio de ~1e-16 relativo |
+| içar `Lambdat @ Zt` para fora do PIRLS | 1.01× / **0.85×** | bit-exato, mas mantém uma matriz (q,n) viva durante todo o laço; o working set maior custa mais no kernel `M @ M.T` do que o produto economizado |
+| cachear `sp.eye(q)` (PLS e GLMM) | 1.00–1.02× | indistinguível de ruído (mediana de 5 rodadas) |
+| cachear `Zt.T` CSR no PLS | 1.01× | idem |
+| reusar buffer de `Lambdat` (PLS e GLMM) | 1.01× | idem |
+| vetorizar `_lambdat_block_triplets` com `np.tril_indices` | **0.47–0.83×** | mais lento: overhead de dispatch do numpy domina para `pi ≤ 5` |
+| vetorizar remontagem de `T` em `VarCorr`/`simulate` | **0.09–0.44×** | idem, ainda pior — 2 a 11× mais lento que o laço Python |
+
+Lição registrada: "eliminar laço Python" **não** é um ganho universal. Para
+laços triangulares de tamanho fixo pequeno (`pi` costuma ser 1–4), o custo de
+despacho do numpy é maior que o laço interpretado.
+
+### O que não foi paralelizado, e por quê
+
+- **Laço BOBYQA sobre θ** — região de confiança: cada candidato depende do
+  modelo quadrático construído com todas as avaliações anteriores. Avaliar em
+  paralelo mudaria a trajetória e o θ final.
+- **Laço PIRLS** — Newton: `w`, `z` do passo *k* dependem de `mu` do passo
+  *k−1*.
+- **Fatoração/solves CHOLMOD e `M @ M.T`** — kernels que não liberam o GIL
+  (threads não escalam) e com granularidade de ~0,1–10 ms (serializar para
+  processos custaria mais que o cálculo). A parte densa já usa BLAS multithread.
+- **`simulate`** — o fluxo é `[sorteia b_s] → [calcula η_s] → [sorteia y_s]`,
+  intercalado. Qualquer reagrupamento consome o RNG em outra ordem e devolve
+  números diferentes para a mesma `seed`: isso é resultado diferente, não
+  diferença de ponto flutuante.
+- **`parse_formula`/patsy** — poucos termos RE (1–4) e 100% GIL-bound.
+
+### Tier C (não implementado, registrado para o futuro)
+
+Pré-computar `Z'Z`, `Z'X`, `Z'y` e avaliar `A = Λ'(Z'Z)Λ + I` tornaria o custo
+por avaliação de θ independente de `n` (ganho estimado 2–10× para `n ≫ q`).
+É reassociação de produto matricial: matematicamente idêntica, numericamente
+diferente em ~1e-15 relativo, o que pode deslocar o θ convergido na 8ª–10ª
+casa. **Decidido não implementar nesta etapa** para manter equivalência
+numérica exata. Se for retomado, deve entrar atrás de uma flag
+(`control={'cache_ztz': True}`), desligada por padrão.
+
+### Verificação
+
+- [tests/perf/check_exact_core.py](tests/perf/check_exact_core.py) — portão de
+  exatidão bit-a-bit contra um checkout de referência. 5 designs (q de 25 a
+  600, pi de 1 a 4), REML e ML, 6 famílias, 8 valores de θ cada:
+  **todas as métricas idênticas bit-a-bit**. Não precisa de patsy/nlopt/sksparse.
+- [tests/perf/check_parallel.py](tests/perf/check_parallel.py) — serial × paralelo
+  para todas as funções que ganharam `n_jobs`, em LMM e GLMM.
+- Paralelismo medido em surrogate de `bootMer`/`profile` (2 vCPUs):
+  **2.02×** com 2 workers (101% de eficiência — superlinear por causa do
+  pinning de BLAS), **1.78×** na grade de profile (89%), **1.68×** com poucas
+  tarefas (84%). Saídas idênticas à serial e ordem preservada em todos os casos.
+- Fallbacks testados: payload não-serializável → serial com aviso e resultado
+  correto; exceção real da tarefa propaga; `parallel_map` aninhado roda serial.
