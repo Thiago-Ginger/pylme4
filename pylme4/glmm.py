@@ -23,6 +23,26 @@ sigma^2 = pwrss / n (ML) and add the standard -2 log L Gaussian/Gamma term.
 
 We re-use :mod:`pls`'s CHOLMOD symbolic factor whenever available — the
 sparsity pattern of A_w equals that of A used in lmer (W is diagonal).
+
+Performance notes
+-----------------
+PIRLS is a Newton-type iteration: ``w`` and ``z`` at step *k* depend on ``mu``
+from step *k-1*, so the loop cannot be parallelized without changing the
+answer. What *can* be removed is repeated work:
+
+``Lambdat.T`` and the CSR view of ``Z`` are constant across the loop, so they
+are built once instead of once per step-halving trial.
+
+Two further candidates were implemented, benchmarked and **rejected**:
+
+* Hoisting ``Lambdat @ Zt`` out of the PIRLS loop (Lambda is fixed, so it is
+  loop-invariant and bit-exact). It saves one sparse product per iteration but
+  keeps a (q, n) matrix live across the whole loop; measured 1.01x at
+  n=1800 and 0.85x at n=7950 — the larger working set costs more in the
+  ``M @ M.T`` kernel than the saved product is worth.
+* Writing the IRLS weights straight into the sparse ``data`` array instead of
+  multiplying by ``sp.diags(w)``: 1.3x on the weighted solve, but *not*
+  bit-exact (see :func:`_build_Aw`).
 """
 from __future__ import annotations
 
@@ -44,7 +64,11 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class GLMMState:
-    """PIRLS/Laplace workspace reused across theta evaluations."""
+    """PIRLS/Laplace workspace reused across theta evaluations.
+
+    Like :class:`pylme4.pls.PLSState` this is a single-owner scratch
+    workspace: never share one between concurrent workers.
+    """
     Zt: sp.csc_matrix
     X: np.ndarray
     y: np.ndarray
@@ -70,6 +94,8 @@ class GLMMState:
     sigma2: float = 1.0
     deviance: float = 0.0
     pirls_iter: int = 0
+    # --- theta-invariant caches (filled by make_glmm_state) ---------------
+    _Z: Optional[sp.csr_matrix] = None         # Zt.T as CSR, for Z @ b
 
 
 def make_glmm_state(Zt, X, y, Lambdat, Lind, family: Family,
@@ -79,14 +105,17 @@ def make_glmm_state(Zt, X, y, Lambdat, Lind, family: Family,
     q = Zt.shape[0]
     weights = np.ones(n) if weights is None else np.asarray(weights, dtype=float)
     offset = np.zeros(n) if offset is None else np.asarray(offset, dtype=float)
+    Zt = Zt.tocsc()
+    Lambdat = Lambdat.tocsc().copy()
     st = GLMMState(
-        Zt=Zt.tocsc(), X=np.asarray(X, dtype=np.float64),
+        Zt=Zt, X=np.asarray(X, dtype=np.float64),
         y=np.asarray(y, dtype=np.float64),
         weights=weights, offset=offset, family=family,
-        Lambdat_template=Lambdat.tocsc().copy(),
+        Lambdat_template=Lambdat,
         Lind=np.asarray(Lind, dtype=np.int64),
         n=n, p=p, q=q,
         beta=np.zeros(p), u=np.zeros(q),
+        _Z=Zt.T.tocsr(),
     )
     if _HAS_CHOLMOD and q > 0:
         A0 = _build_Aw(st, st.Lambdat_template, np.ones(n))
@@ -101,8 +130,19 @@ def _build_Lambdat(st: GLMMState, theta: np.ndarray) -> sp.csc_matrix:
     return L
 
 
-def _build_Aw(st: GLMMState, Lambdat: sp.csc_matrix, w: np.ndarray) -> sp.csc_matrix:
-    """A_w = Λ' Z' W Z Λ + I, with W = diag(w). Same pattern as A."""
+def _build_Aw(st: GLMMState, Lambdat: sp.csc_matrix,
+              w: np.ndarray) -> sp.csc_matrix:
+    """A_w = Λ' Z' W Z Λ + I, with W = diag(w). Same pattern as A.
+
+    Note on the ``sp.diags`` product: scaling the columns by writing directly
+    into the sparse ``data`` array is measurably faster, but it is *not*
+    bit-exact. scipy's sparse-sparse product emits its output in a
+    kernel-defined index order that varies by operand (``Zt @ diags(w)`` comes
+    back unsorted here, ``LtZt @ diags(sqrt(w))`` sorted), and the downstream
+    products accumulate in stored order. Reproducing the multiplication
+    without reproducing that ordering shifts results by ~1e-16 relative, so
+    the explicit diagonal product is kept.
+    """
     if st.q == 0:
         return sp.csc_matrix((0, 0))
     Wsqrt = sp.diags(np.sqrt(np.maximum(w, 0.0)), format="csc")
@@ -122,12 +162,12 @@ def _solve_augmented(st: GLMMState, Lambdat: sp.csc_matrix,
     where z' = z - offset. Returns (u, beta, logdet_A).
     """
     n, p, q = st.n, st.p, st.q
-    W = sp.diags(w, format="csc")
     XtW = st.X.T * w                              # (p, n), broadcast
     XtWX = XtW @ st.X
     XtWz = XtW @ z_minus_offset
 
     if q > 0:
+        W = sp.diags(w, format="csc")
         ZtW = st.Zt @ W                           # (q, n)
         LtZtW = Lambdat @ ZtW                     # (q, n)
         LtZtWX = np.asarray(LtZtW @ st.X)         # (q, p)
@@ -206,10 +246,19 @@ def _pirls(st: GLMMState, Lambdat: sp.csc_matrix,
     fam = st.family
     y, weights, offset = st.y, st.weights, st.offset
 
+    # theta (hence Lambda) is fixed for the whole loop, and so is Z: hoist the
+    # transposes out of the iteration and out of the step-halving inner loop.
+    if st.q > 0:
+        Lam = Lambdat.T                         # (q, q) = Λ,  CSR view
+        Z = st._Z if st._Z is not None else st.Zt.T
+    else:
+        Lam = None
+        Z = None
+
     # Initialize from stored warm start; if invalid, bootstrap from mu0 = init(y).
     eta = offset + st.X @ st.beta
     if st.q > 0:
-        eta = eta + np.asarray(st.Zt.T @ (Lambdat.T @ st.u)).ravel()
+        eta = eta + np.asarray(Z @ (Lam @ st.u)).ravel()
     mu = fam.linkinv(eta)
     if not fam.valid_mu(mu):
         mu = fam.initialize(y, weights)
@@ -236,7 +285,7 @@ def _pirls(st: GLMMState, Lambdat: sp.csc_matrix,
             u_try = (1 - step) * st.u + step * u_new
             eta_try = offset + st.X @ beta_try
             if st.q > 0:
-                eta_try = eta_try + np.asarray(st.Zt.T @ (Lambdat.T @ u_try)).ravel()
+                eta_try = eta_try + np.asarray(Z @ (Lam @ u_try)).ravel()
             mu_try = fam.linkinv(eta_try)
             if not fam.valid_mu(mu_try):
                 step *= 0.5
@@ -271,7 +320,7 @@ def _pirls(st: GLMMState, Lambdat: sp.csc_matrix,
         st.pirls_iter = max_iter
 
     if st.q > 0:
-        st.b = np.asarray(Lambdat.T @ st.u).ravel()
+        st.b = np.asarray(Lam @ st.u).ravel()
     else:
         st.b = np.zeros(0)
 

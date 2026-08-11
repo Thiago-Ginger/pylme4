@@ -58,6 +58,23 @@ class Family:
     def valid_mu(self, mu: np.ndarray) -> bool:
         return bool(np.all(np.isfinite(mu)))
 
+    def __reduce__(self):
+        """Make registry families picklable so they can cross to workers.
+
+        The fields are closures, which pickle cannot serialize. Every family
+        produced by :func:`get_family` is fully determined by its
+        ``(name, link)`` key, so we ship the key and rebuild on the other
+        side. A hand-built :class:`Family` that is not in the registry stays
+        unpicklable — callers fall back to serial execution (see
+        :mod:`pylme4.parallel`), which is correct, just not parallel.
+        """
+        key = (self.name.strip().lower(), self.link.strip().lower())
+        if key in _REGISTRY:
+            return (_rebuild_family, (key,))
+        raise TypeError(
+            f"Family {self.name}({self.link}) is not in pylme4's registry and "
+            f"cannot be pickled; parallel execution will fall back to serial.")
+
 
 # ---------------------------------------------------------------------------
 # Gaussian / identity
@@ -353,6 +370,11 @@ _REGISTRY = {
     ("gamma", "log"): _gamma_log,
     ("gamma", "inverse"): _gamma_inverse,
 }
+
+
+def _rebuild_family(key):
+    """Unpickle hook for :meth:`Family.__reduce__`."""
+    return _REGISTRY[key]()
 
 
 def get_family(family) -> Family:

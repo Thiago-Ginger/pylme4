@@ -14,7 +14,7 @@ dependencies = [
     "pandas>=1.5",
     "patsy>=0.5",
     "scikit-sparse>=0.4.12",
-    "nlopt>=2.7",
+    "nlopt>=2.7,<2.8",  # 2.8+ requires numpy>=2, which conflicts with pandas/pyarrow here
 ]
 
 [project.optional-dependencies]

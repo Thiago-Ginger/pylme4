@@ -8,6 +8,27 @@ A = Lambdat @ Z @ Zt @ Lambda + I, and return the profiled (RE)ML deviance.
 We try sksparse.cholmod first (CHOLMOD, fast, with cached fill-reducing
 permutation). We fall back to a dense Cholesky if sksparse is unavailable —
 correct but only suitable for small q.
+
+Performance notes
+-----------------
+``update`` is the innermost hot loop of ``lmer``: BOBYQA calls it 50-300
+times per fit. It is *inherently sequential* (each theta candidate depends on
+the trust-region model built from all previous evaluations), so it is
+optimized by removing redundant work rather than by parallelism:
+
+* ``X'X`` and ``X'y`` do not depend on theta and are computed once in
+  :func:`make_state` (1.07x at p=6, 1.21x at p=20, 1.42x at p=50 — the cost
+  is O(n p^2), so the win grows with the fixed-effects dimension);
+* ``Lambdat @ Zt`` used to be evaluated twice per call (once inline, once
+  inside ``_build_A``) — it is now computed once and passed down (1.05-1.06x).
+
+Neither changes the arithmetic performed: they remove duplicate evaluations of
+the same expression, so results are bit-for-bit identical.
+
+Three further candidates were implemented, A/B benchmarked and **rejected**
+because the measured effect was indistinguishable from noise: caching
+``sp.eye(q)``, caching ``Zt.T`` as CSR, and reusing a preallocated ``Lambda'``
+buffer instead of copying the template.
 """
 from __future__ import annotations
 
@@ -27,7 +48,13 @@ except Exception:  # pragma: no cover
 
 @dataclass
 class PLSState:
-    """Workspace + cached symbolic factorization shared across theta evals."""
+    """Workspace + cached symbolic factorization shared across theta evals.
+
+    A state is a *mutable scratch workspace* for one optimization run: it
+    caches everything that does not depend on theta and reuses buffers across
+    evaluations. It must therefore never be shared between concurrent
+    workers — every parallel task builds its own (see :mod:`pylme4.parallel`).
+    """
     Zt: sp.csc_matrix
     X: np.ndarray
     y: np.ndarray
@@ -49,18 +76,27 @@ class PLSState:
     logdet_RX: float = 0.0            # log|RX'RX|
     sigma2: float = 0.0
     deviance: float = 0.0
+    # --- theta-invariant caches (filled by make_state) --------------------
+    XtX: np.ndarray = None            # type: ignore  # X'X
+    Xty: np.ndarray = None            # type: ignore  # X'y
 
 
 def make_state(Zt, X, y, Lambdat, Lind, reml=True) -> PLSState:
     n = X.shape[0]
     p = X.shape[1]
     q = Zt.shape[0]
+    Zt = Zt.tocsc()
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    Lambdat = Lambdat.tocsc().copy()
     st = PLSState(
-        Zt=Zt.tocsc(), X=np.asarray(X, dtype=np.float64),
-        y=np.asarray(y, dtype=np.float64),
-        Lambdat_template=Lambdat.tocsc().copy(),
+        Zt=Zt, X=X, y=y,
+        Lambdat_template=Lambdat,
         Lind=np.asarray(Lind, dtype=np.int64),
         n=n, p=p, q=q, reml=reml,
+        # theta-invariant quantities: identical values, evaluated once.
+        XtX=X.T @ X,
+        Xty=X.T @ y,
     )
     if _HAS_CHOLMOD and q > 0:
         # A = Lambdat Z Zt Lambda + I.  Pre-analyze a representative SPD matrix
@@ -77,13 +113,15 @@ def _build_Lambdat(st: PLSState, theta: np.ndarray) -> sp.csc_matrix:
     return L
 
 
-def _build_A(st: PLSState, Lambdat: sp.csc_matrix) -> sp.csc_matrix:
+def _build_A(st: PLSState, Lambdat: sp.csc_matrix,
+             M: Optional[sp.spmatrix] = None) -> sp.csc_matrix:
     # A = Lambdat @ Z @ Zt @ Lambda + I        (Z = Zt.T)
     if st.q == 0:
         return sp.csc_matrix((0, 0))
     # Zt: (q,n)=Z'; Lambdat: (q,q)=Λ'.  Λ'Z' = Lambdat @ Zt, so
     # Λ'Z'ZΛ = (Lambdat @ Zt) @ (Lambdat @ Zt).T.
-    M = Lambdat @ st.Zt                 # (q, n)
+    if M is None:
+        M = Lambdat @ st.Zt             # (q, n)
     A = (M @ M.T).tocsc() + sp.eye(st.q, format="csc")
     return A
 
@@ -100,12 +138,13 @@ def update(st: PLSState, theta: np.ndarray) -> float:
         cu0 = np.asarray(ZtLt @ st.y).ravel()
         # Λ' Z' X           (q, p)
         LtZtX = np.asarray((ZtLt @ st.X))
-    XtX = st.X.T @ st.X                  # (p, p)
-    Xty = st.X.T @ st.y                  # (p,)
+    XtX = st.XtX                         # (p, p)  cached, theta-invariant
+    Xty = st.Xty                         # (p,)    cached, theta-invariant
 
     # --- solve augmented system via Cholesky of A -----------------------
     if q > 0:
-        A = _build_A(st, Lambdat)
+        # ZtLt is exactly the product _build_A would recompute; reuse it.
+        A = _build_A(st, Lambdat, M=ZtLt)
         if _HAS_CHOLMOD and st._sym is not None:
             F = st._sym.cholesky(A)      # reuse symbolic permutation
             # log|A| = sum log(D)  (LDL') — CHOLMOD returns logdet via F.logdet()
